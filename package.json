@@ -1,5 +1,8 @@
 {
   "name": "investigative-reader-proxy",
   "version": "1.0.0",
-  "private": true
+  "private": true,
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0"
+  }
 }
