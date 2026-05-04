@@ -2,6 +2,9 @@
   "functions": {
     "api/messages.js": {
       "maxDuration": 30
+    },
+    "api/summary.js": {
+      "maxDuration": 30
     }
   }
 }
