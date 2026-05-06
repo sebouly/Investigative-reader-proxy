@@ -5,6 +5,9 @@
     },
     "api/summary.js": {
       "maxDuration": 30
+    },
+    "api/confirm-newsfeed.js": {
+      "maxDuration": 15
     }
   }
 }
