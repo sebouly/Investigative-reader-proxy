@@ -5,6 +5,14 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 )
 
+// OpenRouter model — change here to swap providers without touching the app.
+// Examples:
+//   'google/gemini-2.0-flash-001'   (cheap + fast, recommended)
+//   'mistralai/mistral-small'        (EU, great FR)
+//   'anthropic/claude-3.5-haiku'     (previous default via OpenRouter)
+//   'openai/gpt-4o-mini'             (OpenAI option)
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-2.0-flash-001'
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' })
@@ -16,8 +24,8 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Missing cacheKey or prompt' })
   }
 
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' })
+  if (!process.env.OPENROUTER_API_KEY) {
+    return res.status(500).json({ error: 'OPENROUTER_API_KEY not configured on server' })
   }
 
   if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
@@ -36,39 +44,40 @@ export default async function handler(req, res) {
       return res.status(200).json({ summary: cached.summary, cached: true })
     }
 
-    // Log cache miss reason (table missing, etc.) but continue to Claude
     if (cacheError) {
       console.error('Supabase cache read error:', cacheError.message)
     }
 
-    // 2. Cache miss — call Claude API
-    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+    // 2. Cache miss — call OpenRouter (OpenAI-compatible API)
+    const orRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
+        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        // Optional but recommended by OpenRouter for analytics / ranking
+        'HTTP-Referer': 'https://openlensai.app',
+        'X-Title': 'OpenLens AI',
       },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
+        model: OPENROUTER_MODEL,
         max_tokens: 1024,
         messages: [{ role: 'user', content: prompt }],
       }),
     })
 
-    if (!claudeRes.ok) {
-      const errBody = await claudeRes.json().catch(() => ({}))
+    if (!orRes.ok) {
+      const errBody = await orRes.json().catch(() => ({}))
       return res.status(502).json({
-        error: `Claude API returned ${claudeRes.status}`,
+        error: `OpenRouter API returned ${orRes.status}`,
         details: errBody,
       })
     }
 
-    const data = await claudeRes.json()
-    const summary = data.content?.[0]?.text
+    const data = await orRes.json()
+    const summary = data.choices?.[0]?.message?.content
 
     if (!summary) {
-      return res.status(502).json({ error: 'Empty response from Claude', details: data })
+      return res.status(502).json({ error: 'Empty response from OpenRouter', details: data })
     }
 
     // 3. Store in Supabase so all future users get it for free (best-effort)
