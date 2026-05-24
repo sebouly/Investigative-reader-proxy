@@ -13,12 +13,26 @@ const supabase = createClient(
 //   'openai/gpt-4o-mini'             (OpenAI option)
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-2.0-flash-001'
 
+/**
+ * Map a cacheKey prefix to the action type used by the rate-limit function.
+ *   "v2:..."        → summary
+ *   "translate:..." → translation
+ *   "digest:..."    → digest
+ *   everything else → summary (safe default — never bypasses the cap)
+ */
+function actionFromCacheKey(cacheKey) {
+  if (!cacheKey) return 'summary'
+  if (cacheKey.startsWith('translate:')) return 'translation'
+  if (cacheKey.startsWith('digest:'))    return 'digest'
+  return 'summary'
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' })
   }
 
-  const { cacheKey, prompt } = req.body
+  const { cacheKey, prompt, deviceFingerprint } = req.body
 
   if (!cacheKey || !prompt) {
     return res.status(400).json({ error: 'Missing cacheKey or prompt' })
@@ -32,7 +46,20 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'Supabase env vars not configured on server' })
   }
 
+  const action = actionFromCacheKey(cacheKey)
+
   try {
+    // ──────────────────────────────────────────────────────────────────
+    // 0. Server-side rate limit. We always serve the Supabase cache (free,
+    //    no LLM call) BEFORE the cap check so cached hits don't count
+    //    against the user's daily quota. Cap is only enforced on a real
+    //    LLM call.
+    //
+    //    Older clients that don't yet send deviceFingerprint bypass the
+    //    cap — that's intentional during the rollout window. Tighten by
+    //    making deviceFingerprint required once the next APK is live.
+    // ──────────────────────────────────────────────────────────────────
+
     // 1. Check Supabase cache first — free and instant
     const { data: cached, error: cacheError } = await supabase
       .from('summaries')
@@ -48,13 +75,32 @@ export default async function handler(req, res) {
       console.error('Supabase cache read error:', cacheError.message)
     }
 
-    // 2. Cache miss — call OpenRouter (OpenAI-compatible API)
+    // 2. Enforce the daily cap before paying for an LLM call.
+    if (deviceFingerprint) {
+      const { data: capCheck, error: capError } = await supabase.rpc(
+        'check_and_increment_usage',
+        { p_device_fingerprint: deviceFingerprint, p_action: action }
+      )
+
+      if (capError) {
+        // Don't block users on a transient Supabase RPC error — log and proceed.
+        console.error('check_and_increment_usage RPC error:', capError.message)
+      } else if (capCheck && capCheck.allowed === false) {
+        return res.status(429).json({
+          error:  'cap_exceeded',
+          action: capCheck.action,
+          used:   capCheck.used,
+          cap:    capCheck.cap,
+        })
+      }
+    }
+
+    // 3. Cache miss — call OpenRouter (OpenAI-compatible API)
     const orRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        // Optional but recommended by OpenRouter for analytics / ranking
         'HTTP-Referer': 'https://openlensai.app',
         'X-Title': 'OpenLens AI',
       },
@@ -80,7 +126,7 @@ export default async function handler(req, res) {
       return res.status(502).json({ error: 'Empty response from OpenRouter', details: data })
     }
 
-    // 3. Store in Supabase so all future users get it for free (best-effort)
+    // 4. Store in Supabase so all future users get it for free (best-effort)
     const { error: insertError } = await supabase
       .from('summaries')
       .insert({ cache_key: cacheKey, summary })
