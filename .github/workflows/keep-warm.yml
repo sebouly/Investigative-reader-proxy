@@ -1,0 +1,38 @@
+name: Keep Vercel proxy warm
+
+# Pings the /api/summary endpoint every 5 minutes so the Vercel serverless
+# function stays warm. Without this ping, the first user request after a
+# period of inactivity pays a ~500-2000ms cold-start penalty.
+#
+# Cost: GitHub Actions free tier includes 2000 minutes/month for private
+# repos (unlimited for public repos). Each run takes ~10s, so monthly use
+# is ~50min. Well under the limit.
+#
+# Disable: switch the schedule off by either deleting this file or
+# commenting out the `schedule` block, or via the Actions tab → "Keep
+# Vercel proxy warm" workflow → Disable workflow.
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub may delay scheduled runs by a few minutes
+    # under load — that's fine, we just need an approximate cadence.
+    - cron: "*/5 * * * *"
+  # Allow manual trigger from the Actions tab for testing.
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping /api/summary with a tiny no-op prompt
+        run: |
+          curl -sS -X POST https://investigative-reader-proxy.vercel.app/api/summary \
+            -H "Content-Type: application/json" \
+            -d '{"cacheKey":"keep-warm-ping","prompt":"Reply with just: OK"}' \
+            --max-time 30 \
+            -o /tmp/response.json \
+            -w "HTTP %{http_code} in %{time_total}s\n"
+          # Fail the run only on a real server error (5xx). 4xx is acceptable
+          # — it means the function ran, which is what we wanted.
+          cat /tmp/response.json
