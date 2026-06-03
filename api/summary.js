@@ -125,10 +125,12 @@ export default async function handler(req, res) {
         'X-Title': 'OpenLens AI',
       },
       body: JSON.stringify({
-        // `models` = ordered fallback chain. OpenRouter routes to the first
-        // model with a live endpoint, so a single delisted model no longer
-        // breaks every summary. NOTE: send ONLY `models` here — passing both
-        // `model` and `models` makes OpenRouter return a 400.
+        // `model` (required) = primary; `models` (optional) = ordered fallback
+        // chain. OpenRouter tries `model` first, then each entry in `models`,
+        // so a single delisted model no longer breaks every summary. Every
+        // slug here must be a VALID OpenRouter model id — an unknown id in the
+        // list makes the whole request 400.
+        model: OPENROUTER_MODELS[0],
         models: OPENROUTER_MODELS,
         max_tokens: 1024,
         messages: [{ role: 'user', content: prompt }],
