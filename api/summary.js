@@ -146,6 +146,15 @@ export default async function handler(req, res) {
         `OpenRouter ${orRes.status} for models [${OPENROUTER_MODELS.join(', ')}]:`,
         JSON.stringify(errBody),
       )
+      // TEMP DIAGNOSTIC: echo the raw upstream error for our own test key only.
+      if (cacheKey.startsWith('diag-')) {
+        return res.status(502).json({
+          error: 'diagnostic',
+          upstreamStatus: orRes.status,
+          modelsSent: OPENROUTER_MODELS,
+          upstream: errBody,
+        })
+      }
       return res.status(502).json({
         error: 'summary_unavailable',
         message: 'The summary service is temporarily unavailable. Please try again in a moment.',
