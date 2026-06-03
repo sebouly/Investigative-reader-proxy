@@ -53,6 +53,20 @@ export default async function handler(req, res) {
   }
 
   const { cacheKey, prompt, deviceFingerprint } = req.body
+  // Opt-in streaming: new clients send stream:true to receive the summary as
+  // Server-Sent Events (token-by-token). Old clients omit it and keep getting
+  // the single JSON response — fully backwards compatible.
+  const wantStream = req.body.stream === true
+
+  // Emit one SSE data frame to the client.
+  const sseSend = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`)
+  const beginSse = () => {
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+    res.setHeader('Cache-Control', 'no-cache, no-transform')
+    res.setHeader('Connection', 'keep-alive')
+    res.setHeader('X-Accel-Buffering', 'no') // disable proxy buffering
+    if (typeof res.flushHeaders === 'function') res.flushHeaders()
+  }
 
   if (!cacheKey || !prompt) {
     return res.status(400).json({ error: 'Missing cacheKey or prompt' })
@@ -102,6 +116,13 @@ export default async function handler(req, res) {
       .maybeSingle()
 
     if (cached?.summary) {
+      if (wantStream) {
+        // Cache hit in stream mode: emit the whole text as one frame + done.
+        beginSse()
+        sseSend({ delta: cached.summary })
+        res.write('data: [DONE]\n\n')
+        return res.end()
+      }
       return res.status(200).json({ summary: cached.summary, cached: true })
     }
 
@@ -130,6 +151,88 @@ export default async function handler(req, res) {
       } else {
         usageIncremented = true
       }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // 3a. STREAMING path (opt-in). Forward OpenRouter tokens to the client
+    //     as SSE so the summary appears progressively instead of after the
+    //     full generation. We still accumulate the whole text to write the
+    //     Supabase cache at the end.
+    // ──────────────────────────────────────────────────────────────────
+    if (wantStream) {
+      const orStream = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          'HTTP-Referer': 'https://openlensai.app',
+          'X-Title': 'OpenLens AI',
+        },
+        body: JSON.stringify({
+          model: OPENROUTER_MODELS[0],
+          models: OPENROUTER_MODELS.slice(0, 3),
+          max_tokens: 1024,
+          stream: true,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      })
+
+      // Upstream failed before any tokens — still safe to return a JSON error
+      // (SSE headers not sent yet) and refund the quota.
+      if (!orStream.ok || !orStream.body) {
+        const errBody = await orStream.json().catch(() => ({}))
+        console.error(
+          `OpenRouter stream ${orStream.status} for models [${OPENROUTER_MODELS.join(', ')}]:`,
+          JSON.stringify(errBody),
+        )
+        await refundUsage()
+        return res.status(502).json({
+          error: 'summary_unavailable',
+          message: 'The summary service is temporarily unavailable. Please try again in a moment.',
+        })
+      }
+
+      beginSse()
+      let full = ''
+      const decoder = new TextDecoder()
+      let buf = ''
+      try {
+        for await (const chunk of orStream.body) {
+          buf += decoder.decode(chunk, { stream: true })
+          const lines = buf.split('\n')
+          buf = lines.pop() // keep the (possibly partial) last line for next chunk
+          for (const line of lines) {
+            const t = line.trim()
+            if (!t || t.startsWith(':')) continue            // keepalive / comment
+            if (!t.startsWith('data:')) continue
+            const payload = t.slice(5).trim()
+            if (payload === '[DONE]') continue
+            try {
+              const delta = JSON.parse(payload).choices?.[0]?.delta?.content
+              if (delta) { full += delta; sseSend({ delta }) }
+            } catch { /* ignore unparseable keepalive frames */ }
+          }
+        }
+      } catch (streamErr) {
+        console.error('OpenRouter stream read error:', streamErr)
+      }
+
+      if (!full) {
+        // Nothing was generated — refund and signal a clean error to the client.
+        await refundUsage()
+        sseSend({ error: 'summary_unavailable' })
+        res.write('data: [DONE]\n\n')
+        return res.end()
+      }
+
+      // Persist the full summary so future requests hit the cache (best-effort).
+      const { error: insertError } = await supabase
+        .from('summaries')
+        .insert({ cache_key: cacheKey, summary: full })
+      if (insertError) console.error('Supabase cache write error:', insertError.message)
+
+      res.write('data: [DONE]\n\n')
+      return res.end()
     }
 
     // 3. Cache miss — call OpenRouter (OpenAI-compatible API)
@@ -198,6 +301,12 @@ export default async function handler(req, res) {
   } catch (error) {
     console.error('Summary handler error:', error)
     await refundUsage()
+    // If we already started streaming (SSE headers sent), we can't send a JSON
+    // status — close the stream cleanly instead.
+    if (res.headersSent) {
+      try { res.write('data: [DONE]\n\n') } catch {}
+      return res.end()
+    }
     return res.status(500).json({ error: 'Server error', details: error.message })
   }
 }
