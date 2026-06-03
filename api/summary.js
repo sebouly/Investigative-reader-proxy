@@ -131,7 +131,9 @@ export default async function handler(req, res) {
         // slug here must be a VALID OpenRouter model id — an unknown id in the
         // list makes the whole request 400.
         model: OPENROUTER_MODELS[0],
-        models: OPENROUTER_MODELS,
+        // OpenRouter caps the fallback `models` array at 3 items (sending more
+        // returns 400). Send the primary + up to 2 fallbacks.
+        models: OPENROUTER_MODELS.slice(0, 3),
         max_tokens: 1024,
         messages: [{ role: 'user', content: prompt }],
       }),
@@ -146,15 +148,6 @@ export default async function handler(req, res) {
         `OpenRouter ${orRes.status} for models [${OPENROUTER_MODELS.join(', ')}]:`,
         JSON.stringify(errBody),
       )
-      // TEMP DIAGNOSTIC: echo the raw upstream error for our own test key only.
-      if (cacheKey.startsWith('diag-')) {
-        return res.status(502).json({
-          error: 'diagnostic',
-          upstreamStatus: orRes.status,
-          modelsSent: OPENROUTER_MODELS,
-          upstream: errBody,
-        })
-      }
       return res.status(502).json({
         error: 'summary_unavailable',
         message: 'The summary service is temporarily unavailable. Please try again in a moment.',
