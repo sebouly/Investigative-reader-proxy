@@ -68,6 +68,20 @@ export default async function handler(req, res) {
 
   const action = actionFromCacheKey(cacheKey)
 
+  // `usageIncremented` tracks whether step 2 counted this request, so we can
+  // REFUND it on any failure path (incl. the catch below) — a failed
+  // generation must never burn the user's daily quota. Declared at function
+  // scope so the catch block can reach refundUsage().
+  let usageIncremented = false
+  const refundUsage = async () => {
+    if (!usageIncremented) return
+    const { error } = await supabase.rpc('decrement_usage', {
+      p_device_fingerprint: deviceFingerprint,
+      p_action: action,
+    })
+    if (error) console.error('decrement_usage refund error:', error.message)
+  }
+
   try {
     // ──────────────────────────────────────────────────────────────────
     // 0. Server-side rate limit. We always serve the Supabase cache (free,
@@ -104,6 +118,7 @@ export default async function handler(req, res) {
 
       if (capError) {
         // Don't block users on a transient Supabase RPC error — log and proceed.
+        // We did NOT reliably increment, so nothing to refund later.
         console.error('check_and_increment_usage RPC error:', capError.message)
       } else if (capCheck && capCheck.allowed === false) {
         return res.status(429).json({
@@ -112,6 +127,8 @@ export default async function handler(req, res) {
           used:   capCheck.used,
           cap:    capCheck.cap,
         })
+      } else {
+        usageIncremented = true
       }
     }
 
@@ -148,6 +165,7 @@ export default async function handler(req, res) {
         `OpenRouter ${orRes.status} for models [${OPENROUTER_MODELS.join(', ')}]:`,
         JSON.stringify(errBody),
       )
+      await refundUsage()
       return res.status(502).json({
         error: 'summary_unavailable',
         message: 'The summary service is temporarily unavailable. Please try again in a moment.',
@@ -159,6 +177,7 @@ export default async function handler(req, res) {
 
     if (!summary) {
       console.error('Empty response from OpenRouter:', JSON.stringify(data))
+      await refundUsage()
       return res.status(502).json({
         error: 'summary_unavailable',
         message: 'The summary service is temporarily unavailable. Please try again in a moment.',
@@ -178,6 +197,7 @@ export default async function handler(req, res) {
 
   } catch (error) {
     console.error('Summary handler error:', error)
+    await refundUsage()
     return res.status(500).json({ error: 'Server error', details: error.message })
   }
 }
