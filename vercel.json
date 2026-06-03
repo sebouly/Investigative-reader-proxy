@@ -1,5 +1,4 @@
 {
-  "_comment_regions": "Run functions in Frankfurt — close to both the EU users and the Supabase project (eu-north-1, Stockholm). Default was iad1 (US East), which forced every summary to make transatlantic round-trips to Supabase, adding ~1-3s of fixed latency regardless of the LLM call.",
   "regions": ["fra1"],
   "functions": {
     "api/summary.js": {
