@@ -5,13 +5,33 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 )
 
-// OpenRouter model — change here to swap providers without touching the app.
-// Examples:
-//   'google/gemini-2.0-flash-001'   (cheap + fast, recommended)
-//   'mistralai/mistral-small'        (EU, great FR)
-//   'anthropic/claude-3.5-haiku'     (previous default via OpenRouter)
+// OpenRouter model + automatic fallback chain.
+// We send the whole list as the `models` array so OpenRouter routes to the
+// FIRST model that has a live endpoint. If a model gets delisted (the dreaded
+// "No endpoints found for <model>" 404), routing silently falls through to the
+// next one instead of failing the whole request.
+//
+// Override the primary with the OPENROUTER_MODEL env var on Vercel; the
+// fallbacks always stay appended after it.
+// NOTE: the old default 'google/gemini-2.0-flash-001' was DELISTED from
+// OpenRouter (caused the "No endpoints found" 404). All slugs below were
+// verified live on the OpenRouter /models catalog. Re-verify before changing.
+//   'google/gemini-2.5-flash'        (cheap + fast, current default)
 //   'openai/gpt-4o-mini'             (OpenAI option)
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-2.0-flash-001'
+//   'mistralai/mistral-small-2603'   (EU, great FR)
+//   'anthropic/claude-3.5-haiku'     (Anthropic option)
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-2.5-flash'
+
+// De-duplicated chain: primary first, then resilient fallbacks. OpenRouter
+// routes to the first slug with a live endpoint, so a single delisting (like
+// the gemini-2.0 one above) no longer takes down summaries.
+const OPENROUTER_MODELS = [...new Set([
+  OPENROUTER_MODEL,
+  'google/gemini-2.5-flash',
+  'openai/gpt-4o-mini',
+  'mistralai/mistral-small-2603',
+  'anthropic/claude-3.5-haiku',
+])]
 
 /**
  * Map a cacheKey prefix to the action type used by the rate-limit function.
@@ -105,7 +125,11 @@ export default async function handler(req, res) {
         'X-Title': 'OpenLens AI',
       },
       body: JSON.stringify({
-        model: OPENROUTER_MODEL,
+        // `model` = primary; `models` = ordered fallback chain. OpenRouter
+        // routes to the first model with a live endpoint, so a single
+        // delisted model no longer breaks every summary.
+        model: OPENROUTER_MODELS[0],
+        models: OPENROUTER_MODELS,
         max_tokens: 1024,
         messages: [{ role: 'user', content: prompt }],
       }),
@@ -113,9 +137,16 @@ export default async function handler(req, res) {
 
     if (!orRes.ok) {
       const errBody = await orRes.json().catch(() => ({}))
+      // Log the full upstream error server-side for debugging, but never leak
+      // raw provider JSON to the client — the app would render it inside the
+      // summary card. Return a clean, user-safe message instead.
+      console.error(
+        `OpenRouter ${orRes.status} for models [${OPENROUTER_MODELS.join(', ')}]:`,
+        JSON.stringify(errBody),
+      )
       return res.status(502).json({
-        error: `OpenRouter API returned ${orRes.status}`,
-        details: errBody,
+        error: 'summary_unavailable',
+        message: 'The summary service is temporarily unavailable. Please try again in a moment.',
       })
     }
 
@@ -123,7 +154,11 @@ export default async function handler(req, res) {
     const summary = data.choices?.[0]?.message?.content
 
     if (!summary) {
-      return res.status(502).json({ error: 'Empty response from OpenRouter', details: data })
+      console.error('Empty response from OpenRouter:', JSON.stringify(data))
+      return res.status(502).json({
+        error: 'summary_unavailable',
+        message: 'The summary service is temporarily unavailable. Please try again in a moment.',
+      })
     }
 
     // 4. Store in Supabase so all future users get it for free (best-effort)
